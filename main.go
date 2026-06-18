@@ -159,7 +159,13 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%s_%d", fileID, chunkIndex))
+	fileChunksDir := getChunksDirForFile(fileID)
+	if err := os.MkdirAll(fileChunksDir, 0755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, UploadResponse{Success: false, Message: "Failed to create chunks directory: " + err.Error()})
+		return
+	}
+
+	chunkPath := filepath.Join(fileChunksDir, fmt.Sprintf("%d", chunkIndex))
 	if err := os.WriteFile(chunkPath, chunkData, 0644); err != nil {
 		writeJSON(w, http.StatusInternalServerError, UploadResponse{Success: false, Message: "Failed to save chunk: " + err.Error()})
 		return
@@ -256,6 +262,8 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Ints(chunkIndices)
 
+	fileChunksDir := getChunksDirForFile(req.FileID)
+
 	mergedPath := filepath.Join(mergedDir, fs.FileName)
 	outFile, err := os.Create(mergedPath)
 	if err != nil {
@@ -266,7 +274,7 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 
 	h := sha256.New()
 	for _, idx := range chunkIndices {
-		chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%s_%d", req.FileID, idx))
+		chunkPath := filepath.Join(fileChunksDir, fmt.Sprintf("%d", idx))
 		chunkData, err := os.ReadFile(chunkPath)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, MergeResponse{Success: false, Message: "Failed to read chunk: " + err.Error()})
@@ -287,10 +295,7 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 		hashVerified = false
 	}
 
-	for _, idx := range chunkIndices {
-		chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%s_%d", req.FileID, idx))
-		os.Remove(chunkPath)
-	}
+	os.RemoveAll(fileChunksDir)
 
 	writeJSON(w, http.StatusOK, MergeResponse{
 		Success:  true,
@@ -345,6 +350,10 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		Progress:    progress,
 		Completed:   completed,
 	})
+}
+
+func getChunksDirForFile(fileID string) string {
+	return filepath.Join(chunksDir, fileID)
 }
 
 func calculateSHA256(data []byte) string {
