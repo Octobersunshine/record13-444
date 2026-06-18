@@ -37,14 +37,19 @@ type FileStatus struct {
 	Received    map[int]bool
 	ChunkHashes map[int]string
 	FileHash    string
+	Merged      bool
 	mu          sync.Mutex
 }
 
 type UploadResponse struct {
-	Success   bool   `json:"success"`
-	Message   string `json:"message"`
-	ChunkIndex int   `json:"chunk_index,omitempty"`
-	Verified  bool   `json:"verified,omitempty"`
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	ChunkIndex int    `json:"chunk_index,omitempty"`
+	Verified   bool   `json:"verified,omitempty"`
+	Merged     bool   `json:"merged,omitempty"`
+	FilePath   string `json:"file_path,omitempty"`
+	FileHash   string `json:"file_hash,omitempty"`
+	HashMatch  bool   `json:"hash_match,omitempty"`
 }
 
 type MergeResponse struct {
@@ -63,6 +68,7 @@ type StatusResponse struct {
 	Received    int    `json:"received"`
 	Progress    string `json:"progress"`
 	Completed   bool   `json:"completed"`
+	Merged      bool   `json:"merged"`
 }
 
 var (
@@ -198,6 +204,36 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if fs.FileHash == "" {
 		fs.FileHash = fileHash
 	}
+
+	allReceived := len(fs.Received) == fs.TotalChunks
+	alreadyMerged := fs.Merged
+
+	if allReceived && !alreadyMerged {
+		result := mergeFileChunks(fs, fileID)
+		fs.mu.Unlock()
+
+		if result.Success {
+			writeJSON(w, http.StatusOK, UploadResponse{
+				Success:    true,
+				Message:    "Chunk uploaded and verified. All chunks received, file merged automatically",
+				ChunkIndex: chunkIndex,
+				Verified:   true,
+				Merged:     true,
+				FilePath:   result.FilePath,
+				FileHash:   result.FileHash,
+				HashMatch:  result.HashMatch,
+			})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, UploadResponse{
+				Success:    true,
+				Message:    "Chunk uploaded and verified, but auto-merge failed: " + result.ErrMessage,
+				ChunkIndex: chunkIndex,
+				Verified:   true,
+				Merged:     false,
+			})
+		}
+		return
+	}
 	fs.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, UploadResponse{
@@ -241,6 +277,15 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
+	if fs.Merged {
+		writeJSON(w, http.StatusOK, MergeResponse{
+			Success:  true,
+			Message:  "File already merged (auto-merged on upload completion)",
+			FilePath: filepath.Join(mergedDir, fs.FileName),
+		})
+		return
+	}
+
 	if len(fs.Received) != fs.TotalChunks {
 		writeJSON(w, http.StatusBadRequest, MergeResponse{
 			Success: false,
@@ -249,60 +294,19 @@ func handleMerge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chunkIndices := make([]int, 0, fs.TotalChunks)
-	for i := 0; i < fs.TotalChunks; i++ {
-		if !fs.Received[i] {
-			writeJSON(w, http.StatusBadRequest, MergeResponse{
-				Success: false,
-				Message: fmt.Sprintf("Missing chunk %d", i),
-			})
-			return
-		}
-		chunkIndices = append(chunkIndices, i)
-	}
-	sort.Ints(chunkIndices)
+	result := mergeFileChunks(fs, req.FileID)
 
-	fileChunksDir := getChunksDirForFile(req.FileID)
-
-	mergedPath := filepath.Join(mergedDir, fs.FileName)
-	outFile, err := os.Create(mergedPath)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, MergeResponse{Success: false, Message: "Failed to create merged file: " + err.Error()})
+	if !result.Success {
+		writeJSON(w, http.StatusInternalServerError, MergeResponse{Success: false, Message: result.ErrMessage})
 		return
 	}
-	defer outFile.Close()
-
-	h := sha256.New()
-	for _, idx := range chunkIndices {
-		chunkPath := filepath.Join(fileChunksDir, fmt.Sprintf("%d", idx))
-		chunkData, err := os.ReadFile(chunkPath)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, MergeResponse{Success: false, Message: "Failed to read chunk: " + err.Error()})
-			return
-		}
-
-		if _, err := outFile.Write(chunkData); err != nil {
-			writeJSON(w, http.StatusInternalServerError, MergeResponse{Success: false, Message: "Failed to write merged file: " + err.Error()})
-			return
-		}
-
-		h.Write(chunkData)
-	}
-
-	mergedHash := hex.EncodeToString(h.Sum(nil))
-	hashVerified := true
-	if fs.FileHash != "" && mergedHash != fs.FileHash {
-		hashVerified = false
-	}
-
-	os.RemoveAll(fileChunksDir)
 
 	writeJSON(w, http.StatusOK, MergeResponse{
 		Success:  true,
 		Message:  "File merged successfully",
-		FilePath: mergedPath,
-		FileHash: mergedHash,
-		Verified: hashVerified,
+		FilePath: result.FilePath,
+		FileHash: result.FileHash,
+		Verified: result.HashMatch,
 	})
 }
 
@@ -334,6 +338,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	total := fs.TotalChunks
 	fileName := fs.FileName
 	completed := received == total && total > 0
+	merged := fs.Merged
 	fs.mu.Unlock()
 
 	progress := "0%"
@@ -349,7 +354,80 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		Received:    received,
 		Progress:    progress,
 		Completed:   completed,
+		Merged:      merged,
 	})
+}
+
+type MergeResult struct {
+	Success    bool
+	FilePath   string
+	FileHash   string
+	HashMatch  bool
+	ErrMessage string
+}
+
+func mergeFileChunks(fs *FileStatus, fileID string) *MergeResult {
+	chunkIndices := make([]int, 0, fs.TotalChunks)
+	for i := 0; i < fs.TotalChunks; i++ {
+		if !fs.Received[i] {
+			return &MergeResult{
+				Success:    false,
+				ErrMessage: fmt.Sprintf("Missing chunk %d", i),
+			}
+		}
+		chunkIndices = append(chunkIndices, i)
+	}
+	sort.Ints(chunkIndices)
+
+	fileChunksDir := getChunksDirForFile(fileID)
+
+	mergedPath := filepath.Join(mergedDir, fs.FileName)
+	outFile, err := os.Create(mergedPath)
+	if err != nil {
+		return &MergeResult{
+			Success:    false,
+			ErrMessage: "Failed to create merged file: " + err.Error(),
+		}
+	}
+	defer outFile.Close()
+
+	h := sha256.New()
+	for _, idx := range chunkIndices {
+		chunkPath := filepath.Join(fileChunksDir, fmt.Sprintf("%d", idx))
+		chunkData, err := os.ReadFile(chunkPath)
+		if err != nil {
+			return &MergeResult{
+				Success:    false,
+				ErrMessage: fmt.Sprintf("Failed to read chunk %d: %s", idx, err.Error()),
+			}
+		}
+
+		if _, err := outFile.Write(chunkData); err != nil {
+			return &MergeResult{
+				Success:    false,
+				ErrMessage: "Failed to write merged file: " + err.Error(),
+			}
+		}
+
+		h.Write(chunkData)
+	}
+
+	mergedHash := hex.EncodeToString(h.Sum(nil))
+	hashMatch := true
+	if fs.FileHash != "" && mergedHash != fs.FileHash {
+		hashMatch = false
+	}
+
+	os.RemoveAll(fileChunksDir)
+
+	fs.Merged = true
+
+	return &MergeResult{
+		Success:   true,
+		FilePath:  mergedPath,
+		FileHash:  mergedHash,
+		HashMatch: hashMatch,
+	}
 }
 
 func getChunksDirForFile(fileID string) string {

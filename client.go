@@ -48,6 +48,8 @@ func uploadFile(filePath string) error {
 	fmt.Printf("Total chunks: %d\n", totalChunks)
 	fmt.Printf("File hash (SHA256): %s\n\n", fileHash)
 
+	autoMerged := false
+
 	for i := 0; i < totalChunks; i++ {
 		start := i * chunkSize
 		end := start + chunkSize
@@ -59,24 +61,34 @@ func uploadFile(filePath string) error {
 
 		fmt.Printf("Uploading chunk %d/%d (size: %d bytes, hash: %s)...\n", i+1, totalChunks, len(chunkData), chunkHash[:16]+"...")
 
-		if err := uploadChunk(fileID, fileName, fileHash, i, totalChunks, chunkHash, chunkData); err != nil {
+		merged, err := uploadChunk(fileID, fileName, fileHash, i, totalChunks, chunkHash, chunkData)
+		if err != nil {
 			return fmt.Errorf("chunk %d upload failed: %w", i, err)
 		}
+		if merged {
+			autoMerged = true
+		}
 
-		if err := checkStatus(fileID); err != nil {
-			fmt.Printf("Status check warning: %v\n", err)
+		if !autoMerged {
+			if err := checkStatus(fileID); err != nil {
+				fmt.Printf("Status check warning: %v\n", err)
+			}
 		}
 	}
 
-	fmt.Println("\nAll chunks uploaded. Merging file...")
-	if err := mergeFile(fileID); err != nil {
-		return fmt.Errorf("merge failed: %w", err)
+	if !autoMerged {
+		fmt.Println("\nAll chunks uploaded. Merging file...")
+		if err := mergeFile(fileID); err != nil {
+			return fmt.Errorf("merge failed: %w", err)
+		}
+	} else {
+		fmt.Println("\nFile was auto-merged during upload. No manual merge needed.")
 	}
 
 	return nil
 }
 
-func uploadChunk(fileID, fileName, fileHash string, chunkIndex, totalChunks int, chunkHash string, chunkData []byte) error {
+func uploadChunk(fileID, fileName, fileHash string, chunkIndex, totalChunks int, chunkHash string, chunkData []byte) (bool, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
@@ -89,22 +101,22 @@ func uploadChunk(fileID, fileName, fileHash string, chunkIndex, totalChunks int,
 
 	part, err := writer.CreateFormFile("file", fmt.Sprintf("chunk_%d", chunkIndex))
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := part.Write(chunkData); err != nil {
-		return err
+		return false, err
 	}
 	writer.Close()
 
 	req, err := http.NewRequest("POST", serverURL+"/upload", body)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 
@@ -113,17 +125,31 @@ func uploadChunk(fileID, fileName, fileHash string, chunkIndex, totalChunks int,
 	json.Unmarshal(respBody, &result)
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
+		return false, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	if success, ok := result["success"].(bool); ok && !success {
 		msg, _ := result["message"].(string)
-		return fmt.Errorf("upload failed: %s", msg)
+		return false, fmt.Errorf("upload failed: %s", msg)
 	}
 
 	verified, _ := result["verified"].(bool)
+	merged, _ := result["merged"].(bool)
 	fmt.Printf("  -> Chunk %d uploaded successfully (verified: %v)\n", chunkIndex, verified)
-	return nil
+
+	if merged {
+		fmt.Println("\n=== Auto-Merge Triggered ===")
+		if path, ok := result["file_path"].(string); ok {
+			fmt.Printf("Merged file path: %s\n", path)
+		}
+		if hash, ok := result["file_hash"].(string); ok {
+			fmt.Printf("Merged file hash: %s\n", hash)
+		}
+		if hashMatch, ok := result["hash_match"].(bool); ok {
+			fmt.Printf("File hash verified: %v\n", hashMatch)
+		}
+	}
+	return merged, nil
 }
 
 func checkStatus(fileID string) error {
